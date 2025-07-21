@@ -1,0 +1,13 @@
+# Core functionality
+openai
+chromadb
+pydantic
+typer
+tqdm
+pdfplumber
+PyMuPDF
+python-dotenv
+
+# Dev tools
+black
+isort
