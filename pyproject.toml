@@ -1,3 +1,21 @@
+[project]
+name = "athena"
+version = "0.1.0"
+description = "Athena CLI - developer-first semantic memory"
+dependencies = [
+    "typer",
+    "rich"
+]
+
+[project.scripts]
+athena = "cli.main:app"
+
+[tool.setuptools]
+packages = ["cli", "ingestion", "embedding", "retrieval", "sdk", "vectorstore", "chunking", "api"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
 [tool.black]
 line-length = 88
 target-version = ['py311']
