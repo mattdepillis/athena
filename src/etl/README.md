@@ -2,7 +2,15 @@
 
 ## Overview
 The Spotify ETL module powers Athena's ability to ingest, store, and analyze your listening history, playlist metadata, and profile relationships.  
-The design is split into **frequent delta ingestion** jobs and **slower, context-building** jobs to balance freshness, scalability, and API rate limits.
+The design is split into **frequent delta ingestion jobs** and **slower, context-building jobs** to balance freshness, scalability, and API rate limits.
+
+The system:
+- **Upserts** global entities (tracks, albums, artists, playlists) to avoid duplicate storage
+- Maintains **delta cursors** so we only pull new data
+- Tracks **ingest runs** for observability and replay
+- Uses **staging_raw** tables for raw JSON capture, enabling re-processing if mapping changes
+- Stores **images, audio features, and vendor-specific fields** in JSON initially for speed of iteration
+- Stages **playlist IDs** from listening history in a dedicated queue table (`playlist_ingest_queue`) before running the slower playlist job
 
 ---
 
@@ -10,25 +18,33 @@ The design is split into **frequent delta ingestion** jobs and **slower, context
 
 ### 1. Play History Job
 - **Source:** `/me/player/recently-played`
-- **Purpose:** Capture tracks played since the last ingestion
+- **Purpose:** Capture all tracks played since the last ingestion
 - **Frequency:** Daily or on manual trigger
 - **Tables Written:**
-  - `play_history` (fact table)
+  - `play_history` (fact table, growing over time)
   - `tracks` (upsert)
   - `albums`, `artists`, `track_artists` (upsert)
+  - `playlist_ingest_queue` (temporary staging for new playlist IDs)
 - **Special Logic:**
-  - Stores `context_type` and `context_uri` (e.g., playlist, album)
-  - Detects new playlist IDs for later ingestion
+  - Stores `context_type` and `context_uri` (e.g., playlist, album, artist, DJ session)
+  - Extracts playlist IDs from `context_uri` and adds them to `playlist_ingest_queue` (deduped)
+  - Only fetches `audio_features` for tracks missing them
+  - Advances a stored **cursor** so we can run true deltas
 
 ---
 
 ### 2. Playlist Metadata Job
 - **Source:** `/me/playlists` + `/playlists/{id}`
 - **Purpose:** Store playlist metadata and track composition
-- **Frequency:** Weekly or on-demand when new playlists detected
+- **Frequency:** Weekly or on-demand when new playlists detected from `playlist_ingest_queue`
 - **Tables Written:**
   - `playlists`
   - `playlist_tracks` (join table)
+- **Special Logic:**
+  - Images stored as JSON array (`images_json`)
+  - Owner data upserted into `users`
+  - Skips refresh if `last_refreshed` < 7 days old
+  - Clears processed IDs from `playlist_ingest_queue`
 
 ---
 
@@ -39,60 +55,87 @@ The design is split into **frequent delta ingestion** jobs and **slower, context
 - **Tables Written:**
   - `users`
   - `user_relationships`
+- **Special Logic:**
+  - Stores whether a user is “me”
+  - Friend relationships as a join table for later graph analytics
 
 ---
 
-## Table Schema
+## Table Schema (v0, additive-friendly)
 
 ### `tracks`
-| column     | type    | notes |
-|------------|---------|-------|
-| track_id   | TEXT PK | Spotify track ID |
-| name       | TEXT    | Track name |
-| album_id   | TEXT FK | Album reference |
-| uri        | TEXT    | Spotify URI |
+| column               | type    | notes |
+|----------------------|---------|-------|
+| track_id             | TEXT PK | Spotify track ID |
+| name                 | TEXT    | Track name |
+| album_id             | TEXT    | Album reference |
+| duration_ms          | INTEGER | Length |
+| popularity           | INTEGER | Spotify popularity score |
+| uri                  | TEXT    | Spotify URI |
+| is_local             | BOOLEAN | Local file flag |
+| audio_features_json  | TEXT    | Raw JSON from `/audio-features` |
+| created_at           | TEXT    | Insert timestamp |
+| last_updated         | TEXT    | Last upsert timestamp |
+
+---
 
 ### `albums`
-| album_id   | TEXT PK | Spotify album ID |
-| name       | TEXT    | Album name |
-| release_date | TEXT  | Release date |
-| image_url	 | TEXT    | Largest available image |
+| album_id     | TEXT PK | Spotify album ID |
+| name         | TEXT    | Album name |
+| release_date | TEXT    | Release date |
+| uri          | TEXT    | Spotify URI |
+| images_json  | TEXT    | Array of `{url,width,height}` |
+| last_updated | TEXT    | Last upsert timestamp |
+
+---
 
 ### `artists`
-| artist_id  | TEXT PK | Spotify artist ID |
-| name       | TEXT    | Artist name |
-| image_url	 | TEXT    | Largest available image |
+| artist_id    | TEXT PK | Spotify artist ID |
+| name         | TEXT    | Artist name |
+| uri          | TEXT    | Spotify URI |
+| images_json  | TEXT    | Array of `{url,width,height}` |
+| last_updated | TEXT    | Last upsert timestamp |
+
+---
 
 ### `track_artists`
-| track_id   | TEXT FK | Track reference |
-| artist_id  | TEXT FK | Artist reference |
+| track_id     | TEXT    | Track reference |
+| artist_id    | TEXT    | Artist reference |
+| PRIMARY KEY  | (track_id, artist_id) |
+
+---
 
 ### `play_history`
-| played_at  | TEXT    | Timestamp |
-| track_id   | TEXT FK | Track reference |
-| context_type | TEXT  | Playlist, album, artist, etc. |
-| context_uri | TEXT   | URI of source context |
+| play_id      | INTEGER PK | Auto-increment |
+| user_id      | TEXT    | User reference |
+| track_id     | TEXT    | Track reference |
+| played_at    | TEXT    | ISO8601 timestamp |
+| context_type | TEXT    | Playlist, album, artist, etc. |
+| context_uri  | TEXT    | URI of source context |
+| source       | TEXT    | e.g. `spotify` |
+| ingested_at  | TEXT    | Timestamp of ingestion |
+
+**Unique Index:** `(user_id, track_id, played_at)` to prevent duplicates.
+
+---
+
+### `playlist_ingest_queue`
+| playlist_id  | TEXT PK | Spotify playlist ID |
+| detected_at  | TEXT    | When the playlist was detected for ingestion |
+
+---
 
 ### `playlists`
-| playlist_id | TEXT PK | Spotify playlist ID |
-| name        | TEXT    | Playlist name |
-| owner_id    | TEXT    | Creator's user ID |
-| owner_type  | TEXT    | 'user', 'spotify', 'brand' |
-| public      | BOOLEAN | Public/private flag |
-| collaborative | BOOLEAN | Collaboration flag |
-
-### `playlist_tracks`
-| playlist_id | TEXT FK | Playlist reference |
-| track_id    | TEXT FK | Track reference |
-| added_at    | TEXT    | When track was added |
-
-### `users`
-| user_id     | TEXT PK | Spotify user ID |
-| display_name| TEXT    | User display name |
-
-### `user_relationships`
-| user_id     | TEXT FK | User reference |
-| friend_id   | TEXT FK | Followed user ID |
+| playlist_id  | TEXT PK | Spotify playlist ID |
+| name         | TEXT    | Playlist name |
+| owner_id     | TEXT    | Creator's user ID |
+| owner_type   | TEXT    | 'user', 'spotify', 'brand' |
+| public       | BOOLEAN | Public/private flag |
+| collaborative| BOOLEAN | Collaboration flag |
+| description  | TEXT    | Playlist description |
+| uri          | TEXT    | Spotify URI |
+| images_json  | TEXT    | Array of `{url,width,height}` |
+| last_refreshed | TEXT  | Last metadata pull |
 
 ---
 
