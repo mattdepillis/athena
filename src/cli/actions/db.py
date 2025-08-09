@@ -1,6 +1,6 @@
 import typer
 
-from db import cleanup, init
+from db.spin import cleanup, init
 
 app = typer.Typer(help="Database management")
 
